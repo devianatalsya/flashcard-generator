@@ -3,7 +3,7 @@
  *
  * Konfigurasi dan fungsi untuk memanggil Gemini API.
  * API key dibaca dari environment variable GEMINI_API_KEY.
- * File ini HANYA dijalankan di server, tidak pernah dikirim ke browser.
+ * File ini HANYA dijalankan di server.
  */
 
 import { GoogleGenerativeAI } from "@google/generative-ai";
@@ -20,16 +20,11 @@ export interface FlashcardResult {
 
 /**
  * Membuat flashcard dari teks materi menggunakan Gemini AI.
- *
- * @param text - Teks materi yang sudah diekstrak dari PDF/DOCX
- * @param cardCount - Jumlah flashcard yang diminta (1-10)
- * @returns Array of flashcard {question, answer}
  */
 export async function generateFlashcardsWithGemini(
   text: string,
   cardCount: number
 ): Promise<FlashcardResult> {
-  // Ambil API key dari environment variable (hanya tersedia di server)
   const apiKey = process.env.GEMINI_API_KEY;
 
   if (!apiKey) {
@@ -38,9 +33,9 @@ export async function generateFlashcardsWithGemini(
     );
   }
 
-  // Batasi panjang teks agar tidak melebihi context window
-  // Gemini 2.5 Flash mendukung 1M token, tapi kita batasi untuk efisiensi
+  // Batasi panjang materi
   const MAX_CHARS = 50000;
+
   const truncatedText =
     text.length > MAX_CHARS
       ? text.slice(0, MAX_CHARS) +
@@ -48,22 +43,26 @@ export async function generateFlashcardsWithGemini(
       : text;
 
   if (truncatedText.length < 50) {
-    throw new Error("Materi terlalu pendek untuk membuat flashcard yang bermakna.");
+    throw new Error(
+      "Materi terlalu pendek untuk membuat flashcard yang bermakna."
+    );
   }
 
-  // Inisialisasi Gemini API client
   const genAI = new GoogleGenerativeAI(apiKey);
 
-  // Gunakan Gemini 2.5 Flash (tersedia di free tier)
-  const model = genAI.getGenerativeModel({
-    model: "gemini-3.5-flash-lite",
-    generationConfig: {
-      responseMimeType: "application/json",
-      temperature: 0.7,
-    },
-  });
+  /*
+   * Model utama.
+   *
+   * Kalau model ini sedang overload dan memberikan 503,
+   * sistem akan melakukan retry terlebih dahulu.
+   *
+   * Jika masih gagal, sistem mencoba fallback.
+   */
+  const models = [
+    "gemini-3.5-flash-lite",
+    "gemini-2.5-flash",
+  ];
 
-  // Prompt yang dikirim ke AI
   const prompt = `Kamu adalah asisten belajar yang bertugas membuat flashcard dari materi pelajaran.
 
 TUGAS:
@@ -77,7 +76,7 @@ ATURAN WAJIB:
 5. Jumlah flashcard HARUS tepat ${cardCount}, tidak kurang, tidak lebih.
 6. Output HARUS dalam format JSON yang valid seperti contoh di bawah.
 
-FORMAT OUTPUT JSON (ikuti persis):
+FORMAT OUTPUT JSON:
 {
   "flashcards": [
     {
@@ -94,67 +93,185 @@ ${truncatedText}
 
 Sekarang buat ${cardCount} flashcard dalam format JSON.`;
 
-  try {
-    const result = await model.generateContent(prompt);
-    const responseText = result.response.text();
+  let lastError: unknown = null;
 
-    // Parse JSON response
-    let parsed: FlashcardResult;
-    try {
-      parsed = JSON.parse(responseText);
-    } catch {
-      // Coba ekstrak JSON dari dalam teks jika ada teks tambahan
-      const jsonMatch = responseText.match(/\{[\s\S]*"flashcards"[\s\S]*\}/);
-      if (jsonMatch) {
-        parsed = JSON.parse(jsonMatch[0]);
-      } else {
-        throw new Error(
-          "AI menghasilkan respons yang bukan JSON valid. Coba generate ulang."
+  /*
+   * Coba model satu per satu.
+   */
+  for (const modelName of models) {
+    const model = genAI.getGenerativeModel({
+      model: modelName,
+      generationConfig: {
+        responseMimeType: "application/json",
+        temperature: 0.7,
+      },
+    });
+
+    /*
+     * Retry maksimal 3 kali untuk error sementara seperti 503.
+     */
+    const MAX_RETRIES = 3;
+
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        console.log(
+          `[Gemini] Mencoba model ${modelName}, attempt ${attempt}/${MAX_RETRIES}`
         );
+
+        const result = await model.generateContent(prompt);
+        const responseText = result.response.text();
+
+        // Parse JSON
+        let parsed: FlashcardResult;
+
+        try {
+          parsed = JSON.parse(responseText);
+        } catch {
+          // Kalau AI memberikan JSON dengan tambahan teks
+          const jsonMatch = responseText.match(
+            /\{[\s\S]*"flashcards"[\s\S]*\}/
+          );
+
+          if (!jsonMatch) {
+            throw new Error(
+              "AI menghasilkan respons yang bukan JSON valid. Coba generate ulang."
+            );
+          }
+
+          parsed = JSON.parse(jsonMatch[0]);
+        }
+
+        // Validasi struktur
+        if (!parsed.flashcards || !Array.isArray(parsed.flashcards)) {
+          throw new Error(
+            'Format respons AI tidak sesuai. Field "flashcards" tidak ditemukan.'
+          );
+        }
+
+        if (parsed.flashcards.length === 0) {
+          throw new Error(
+            "AI tidak menghasilkan flashcard. Materi mungkin terlalu sedikit."
+          );
+        }
+
+        // Validasi setiap flashcard
+        const validCards = parsed.flashcards.filter(
+          (card) =>
+            card &&
+            typeof card.question === "string" &&
+            card.question.trim() !== "" &&
+            typeof card.answer === "string" &&
+            card.answer.trim() !== ""
+        );
+
+        if (validCards.length === 0) {
+          throw new Error(
+            "Semua flashcard tidak valid. Coba generate ulang."
+          );
+        }
+
+        /*
+         * Berhasil.
+         */
+        console.log(`[Gemini] Berhasil menggunakan model ${modelName}`);
+
+        return {
+          flashcards: validCards.slice(0, cardCount),
+        };
+      } catch (err: unknown) {
+        lastError = err;
+
+        const message =
+          err instanceof Error ? err.message : String(err);
+
+        const lowerMessage = message.toLowerCase();
+
+        const is503 =
+          lowerMessage.includes("503") ||
+          lowerMessage.includes("service unavailable") ||
+          lowerMessage.includes("high demand") ||
+          lowerMessage.includes("overloaded");
+
+        const is429 =
+          lowerMessage.includes("429") ||
+          lowerMessage.includes("rate limit") ||
+          lowerMessage.includes("quota");
+
+        const isAuthError =
+          lowerMessage.includes("401") ||
+          lowerMessage.includes("403") ||
+          lowerMessage.includes("api key") ||
+          lowerMessage.includes("invalid api key");
+
+        /*
+         * API key salah → tidak perlu retry.
+         */
+        if (isAuthError) {
+          throw new Error(
+            "API key Gemini tidak valid atau tidak memiliki akses ke model. Pastikan GEMINI_API_KEY di .env.local sudah benar."
+          );
+        }
+
+        /*
+         * Kalau quota/rate limit → jangan spam request.
+         */
+        if (is429) {
+          throw new Error(
+            "Quota atau rate limit Gemini API tercapai. Silakan tunggu beberapa saat lalu coba lagi."
+          );
+        }
+
+        /*
+         * Kalau 503 → tunggu lalu retry.
+         */
+        if (is503 && attempt < MAX_RETRIES) {
+          const delay = attempt * 2000;
+
+          console.log(
+            `[Gemini] Model ${modelName} sedang overload. Retry dalam ${delay}ms...`
+          );
+
+          await new Promise((resolve) =>
+            setTimeout(resolve, delay)
+          );
+
+          continue;
+        }
+
+        /*
+         * Kalau bukan 503 atau retry sudah habis,
+         * keluar dari loop retry dan coba model berikutnya.
+         */
+        break;
       }
     }
 
-    // Validasi struktur JSON
-    if (!parsed.flashcards || !Array.isArray(parsed.flashcards)) {
-      throw new Error('Format respons AI tidak sesuai. Field "flashcards" tidak ditemukan.');
-    }
-
-    if (parsed.flashcards.length === 0) {
-      throw new Error("AI tidak menghasilkan flashcard. Materi mungkin terlalu sedikit.");
-    }
-
-    // Validasi setiap flashcard punya question dan answer
-    const validCards = parsed.flashcards.filter(
-      (card) =>
-        card &&
-        typeof card.question === "string" &&
-        card.question.trim() !== "" &&
-        typeof card.answer === "string" &&
-        card.answer.trim() !== ""
+    console.log(
+      `[Gemini] Model ${modelName} gagal. Mencoba fallback berikutnya...`
     );
-
-    if (validCards.length === 0) {
-      throw new Error("Semua flashcard tidak valid. Coba generate ulang.");
-    }
-
-    return { flashcards: validCards };
-  } catch (err: unknown) {
-    // Handle error rate limit Gemini
-    if (err instanceof Error) {
-      const msg = err.message.toLowerCase();
-      if (msg.includes("rate limit") || msg.includes("quota") || msg.includes("429")) {
-        throw new Error(
-          "API rate limit tercapai. Silakan tunggu beberapa menit lalu coba lagi."
-        );
-      }
-      if (msg.includes("api key") || msg.includes("invalid") || msg.includes("401")) {
-        throw new Error(
-          "API key tidak valid. Pastikan GEMINI_API_KEY di file .env.local sudah benar."
-        );
-      }
-      // Re-throw error yang sudah kita format
-      throw err;
-    }
-    throw new Error("Terjadi kesalahan saat menghubungi Gemini API.");
   }
+
+  /*
+   * Semua model gagal.
+   */
+  if (lastError instanceof Error) {
+    const message = lastError.message.toLowerCase();
+
+    if (
+      message.includes("503") ||
+      message.includes("service unavailable") ||
+      message.includes("high demand") ||
+      message.includes("overloaded")
+    ) {
+      throw new Error(
+        "Server Gemini sedang mengalami traffic tinggi. Sistem sudah mencoba beberapa kali. Silakan coba lagi beberapa saat."
+      );
+    }
+
+    throw lastError;
+  }
+
+  throw new Error(
+    "Terjadi kesalahan saat menghubungi Gemini API. Silakan coba lagi."
+  );
 }

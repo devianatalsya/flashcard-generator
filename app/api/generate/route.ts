@@ -23,14 +23,12 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Ambil file dari FormData
+    // Ambil inputType: "file" atau "text"
+    const inputType = String(formData.get("inputType") || "file");
+    const rawText = formData.get("text");
+
+    // Ambil file dari FormData jika ada
     const file = formData.get("file");
-    if (!file || !(file instanceof File)) {
-      return NextResponse.json(
-        { error: "File tidak ditemukan. Silakan upload file PDF atau DOCX." },
-        { status: 400 }
-      );
-    }
 
     // Ambil jumlah kartu
     const cardCountRaw = formData.get("cardCount");
@@ -42,63 +40,83 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Validasi ukuran file (maks 20MB)
-    if (file.size === 0) {
-      return NextResponse.json(
-        { error: "File kosong. Silakan upload file yang berisi materi." },
-        { status: 400 }
-      );
-    }
+    let extractedText = "";
 
-    if (file.size > 20 * 1024 * 1024) {
-      return NextResponse.json(
-        { error: "Ukuran file terlalu besar. Maksimal 20MB." },
-        { status: 400 }
-      );
-    }
-
-    // Validasi tipe file berdasarkan nama dan MIME type
-    const fileName = file.name.toLowerCase();
-    const isPDF = fileName.endsWith(".pdf") || file.type === "application/pdf";
-    const isDOCX =
-      fileName.endsWith(".docx") ||
-      file.type ===
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-
-    if (!isPDF && !isDOCX) {
-      return NextResponse.json(
-        {
-          error:
-            "Format file tidak didukung. Hanya file PDF (.pdf) dan Word (.docx) yang diizinkan.",
-        },
-        { status: 400 }
-      );
-    }
-
-    // Konversi File ke Buffer untuk diproses
-    const arrayBuffer = await file.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-
-    // Ekstrak teks dari file
-    let extractedText: string;
-    try {
-      if (isPDF) {
-        extractedText = await extractTextFromPDF(buffer);
-      } else {
-        extractedText = await extractTextFromDOCX(buffer);
+    if (inputType === "text" || (typeof rawText === "string" && rawText.trim().length > 0 && (!file || !(file instanceof File)))) {
+      // Jalur Teks Langsung
+      extractedText = typeof rawText === "string" ? rawText.trim() : "";
+      if (!extractedText) {
+        return NextResponse.json(
+          { error: "Teks materi tidak boleh kosong. Masukkan teks materi terlebih dahulu." },
+          { status: 400 }
+        );
       }
-    } catch (err: unknown) {
-      const message =
-        err instanceof Error ? err.message : "Gagal membaca isi file.";
-      return NextResponse.json({ error: message }, { status: 422 });
+    } else {
+      // Jalur File Upload (PDF / DOCX)
+      if (!file || !(file instanceof File)) {
+        return NextResponse.json(
+          { error: "File tidak ditemukan. Silakan upload file PDF atau DOCX." },
+          { status: 400 }
+        );
+      }
+
+      // Validasi ukuran file (maks 20MB)
+      if (file.size === 0) {
+        return NextResponse.json(
+          { error: "File kosong. Silakan upload file yang berisi materi." },
+          { status: 400 }
+        );
+      }
+
+      if (file.size > 20 * 1024 * 1024) {
+        return NextResponse.json(
+          { error: "Ukuran file terlalu besar. Maksimal 20MB." },
+          { status: 400 }
+        );
+      }
+
+      // Validasi tipe file berdasarkan nama dan MIME type
+      const fileName = file.name.toLowerCase();
+      const isPDF = fileName.endsWith(".pdf") || file.type === "application/pdf";
+      const isDOCX =
+        fileName.endsWith(".docx") ||
+        file.type ===
+          "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+
+      if (!isPDF && !isDOCX) {
+        return NextResponse.json(
+          {
+            error:
+              "Format file tidak didukung. Hanya file PDF (.pdf) dan Word (.docx) yang diizinkan.",
+          },
+          { status: 400 }
+        );
+      }
+
+      // Konversi File ke Buffer untuk diproses
+      const arrayBuffer = await file.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+
+      // Ekstrak teks dari file
+      try {
+        if (isPDF) {
+          extractedText = await extractTextFromPDF(buffer);
+        } else {
+          extractedText = await extractTextFromDOCX(buffer);
+        }
+      } catch (err: unknown) {
+        const message =
+          err instanceof Error ? err.message : "Gagal membaca isi file.";
+        return NextResponse.json({ error: message }, { status: 422 });
+      }
     }
 
     // Validasi panjang teks
-    if (extractedText.trim().length < 100) {
+    if (extractedText.trim().length < 50) {
       return NextResponse.json(
         {
           error:
-            "Materi terlalu pendek (kurang dari 100 karakter). Silakan upload file yang berisi materi yang lebih lengkap.",
+            "Materi terlalu pendek (kurang dari 50 karakter). Silakan masukkan atau upload materi yang lebih lengkap.",
         },
         { status: 422 }
       );
