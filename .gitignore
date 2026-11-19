@@ -1,0 +1,6 @@
+# Git ignore - file-file yang tidak perlu di-upload ke GitHub
+node_modules/
+.next/
+.env.local
+.env
+*.env
