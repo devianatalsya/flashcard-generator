@@ -60,7 +60,7 @@ export async function generateFlashcardsWithGemini(
    */
   const models = [
     "gemini-3.5-flash-lite",
-    "gemini-2.5-flash",
+    "gemini-3.8-flash",
   ];
 
   const prompt = `Kamu adalah asisten belajar yang bertugas membuat flashcard dari materi pelajaran.
